@@ -21,8 +21,6 @@
  *  DEALINGS IN THE SOFTWARE.
  */
 
-#![cfg_attr(feature = "simd", feature(portable_simd))]
-
 #[cfg(feature = "tracing")]
 use tracing_subscriber::prelude::*;
 #[cfg(feature = "tracing")]
@@ -30,30 +28,10 @@ use tracing_tree::HierarchicalLayer;
 
 use std::env;
 
-mod air;
-mod ast;
-mod driver;
-mod errors;
-mod expr;
-mod lexing;
-mod mir;
-mod parsing;
-mod preprocessing;
-mod semantics;
-mod symtab;
-mod types;
-mod x64;
+use asjcc::driver;
 
 fn main() -> Result<(), ()> {
     let args: Vec<String> = env::args().collect();
-
-    if args.len() < 2 {
-        eprintln!(
-            "Usage: {} [--lex|--parse|--validate|--codegen] [-S] [-o <output>] <c-file> [<c-file> ...]",
-            args[0]
-        );
-        std::process::exit(1);
-    }
 
     #[cfg(feature = "tracing")]
     let subscriber =
@@ -61,8 +39,8 @@ fn main() -> Result<(), ()> {
     #[cfg(feature = "tracing")]
     tracing::subscriber::set_global_default(subscriber).unwrap();
 
-    let (translations, arguments) = driver::parse_args(&args);
-    driver::run(&translations, &arguments);
+    let (translations, config) = driver::parse_args(&args);
+    driver::run(&translations, &config);
 
     Ok(())
 }
