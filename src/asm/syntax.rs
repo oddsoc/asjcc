@@ -21,26 +21,22 @@
  *  DEALINGS IN THE SOFTWARE.
  */
 
-#[cfg(feature = "tracing")]
-use tracing_subscriber::prelude::*;
-#[cfg(feature = "tracing")]
-use tracing_tree::HierarchicalLayer;
+pub const OPERAND_COL: usize = 8;
 
-use std::env;
-
-use asjcc::driver;
-
-fn main() -> Result<(), ()> {
-    let args: Vec<String> = env::args().collect();
-
-    #[cfg(feature = "tracing")]
-    let subscriber =
-        tracing_subscriber::registry().with(HierarchicalLayer::new(2)); // 2 = indentation spaces
-    #[cfg(feature = "tracing")]
-    tracing::subscriber::set_global_default(subscriber).unwrap();
-
-    let (translations, config) = driver::parse_args(&args);
-    driver::run(&translations, &config);
-
-    Ok(())
+pub fn pad_inst(s: &str) -> String {
+    let rest = s.strip_prefix('\t').unwrap_or(s);
+    let mut out = String::with_capacity(s.len() + 12);
+    out.push('\t');
+    match rest.find([' ', '\t']) {
+        Some(i) if i > 0 => {
+            out.push_str(&rest[..i]);
+            let pad = OPERAND_COL.saturating_sub(i).max(1);
+            for _ in 0..pad {
+                out.push(' ');
+            }
+            out.push_str(&rest[i..].trim_start_matches([' ', '\t']));
+        }
+        _ => out.push_str(rest),
+    }
+    out
 }
