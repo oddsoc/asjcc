@@ -24,9 +24,14 @@
 use std::collections::HashSet;
 
 use crate::ast::*;
-use crate::errors::{Error, ErrorClass::Semantic, SemanticError, error};
+use crate::errors::{
+    Error,
+    ErrorClass::{Parsing, Semantic},
+    ParsingError, SemanticError,
+};
 use crate::expr::*;
 use crate::symtab::*;
+use crate::walk::ast::AstVisitor;
 
 pub struct Analyser;
 
@@ -34,290 +39,329 @@ impl Analyser {
     pub fn new() -> Analyser {
         Analyser {}
     }
+}
 
-    fn walk(
-        &self,
-        arena: &mut AstArena,
-        symtab: &SymTab,
+impl AstVisitor for Analyser {
+    fn enter(
+        &mut self,
+        stage: &mut AstStage<'_>,
         id: AstId,
     ) -> Result<(), Error> {
-        let kind = arena[id].kind.clone();
+        let kind = stage.arena[id].kind.clone();
 
         match &kind {
-            AstKind::Function {
-                params,
-                block,
-                type_spec,
-                ..
-            } => {
+            AstKind::Function { params, block, .. } => {
                 for &param in params {
-                    if let AstKind::Parameter { .. } = &arena[param].kind {
-                        self.walk(arena, symtab, param)?;
+                    if let AstKind::Parameter { .. } = &stage.arena[param].kind
+                    {
                     } else if block.is_some() {
-                        return Err(error(Semantic(
+                        return Err(stage.arena.node_error(id, Semantic(
                             SemanticError::UnnamedParameterInFunctionDefinition,
                         )));
-                    } else {
-                        self.walk(arena, symtab, param)?;
-                    }
-                }
-
-                self.walk(arena, symtab, *type_spec)?;
-
-                if let Some(block) = block {
-                    self.walk(arena, symtab, *block)?;
-                }
-
-                Ok(())
-            }
-            AstKind::Block { body } => {
-                for &stmt in body {
-                    self.walk(arena, symtab, stmt)?;
-                }
-                Ok(())
-            }
-
-            AstKind::Variable {
-                type_spec, init, ..
-            } => {
-                self.walk(arena, symtab, *type_spec)?;
-                if let Some(init) = init {
-                    let init_val = *init;
-                    check(arena, symtab, init_val)?;
-                    let folded = fold(arena, init_val);
-                    arena[init_val] = arena[folded].clone();
-                    if let Some(sym) = resolve(symtab, arena, &id) {
-                        if has_static_storage_duration(symtab, sym) {
-                            if !is_const_expr(arena, init_val) {
-                                return Err(error(Semantic(
-                                    SemanticError::NotAConstExpression,
-                                )));
-                            }
-                        }
                     }
                 }
 
                 Ok(())
             }
-            AstKind::Parameter { type_spec, .. } => {
-                self.walk(arena, symtab, *type_spec)?;
-                Ok(())
-            }
-            AstKind::Return { expr, .. } => {
-                let expr_val = *expr;
-                check(arena, symtab, expr_val)?;
-                let folded = fold(arena, expr_val);
-                arena[expr_val] = arena[folded].clone();
-                Ok(())
-            }
-            AstKind::If {
-                cond,
-                then,
-                otherwise,
-            } => {
-                let cond_val = *cond;
-                check(arena, symtab, cond_val)?;
-                let folded = fold(arena, cond_val);
-                arena[cond_val] = arena[folded].clone();
-                self.walk(arena, symtab, *then)?;
-                if let Some(otherwise) = otherwise {
-                    self.walk(arena, symtab, *otherwise)?;
-                }
-                Ok(())
-            }
-            AstKind::DoWhile { cond, body } => {
-                let cond_val = *cond;
-                check(arena, symtab, cond_val)?;
-                let folded = fold(arena, cond_val);
-                arena[cond_val] = arena[folded].clone();
-                self.walk(arena, symtab, *body)?;
-                Ok(())
-            }
-            AstKind::While { cond, body } => {
-                let cond_val = *cond;
-                check(arena, symtab, cond_val)?;
-                let folded = fold(arena, cond_val);
-                arena[cond_val] = arena[folded].clone();
-                self.walk(arena, symtab, *body)?;
-                Ok(())
-            }
-            AstKind::For {
-                init,
-                cond,
-                post,
-                body,
-            } => {
-                if let Some(init) = init {
-                    self.walk(arena, symtab, *init)?;
-                }
 
-                if let Some(cond) = cond {
-                    let cond_val = *cond;
-                    check(arena, symtab, cond_val)?;
-                    let folded = fold(arena, cond_val);
-                    arena[cond_val] = arena[folded].clone();
-                }
-
-                if let Some(post) = post {
-                    self.walk(arena, symtab, *post)?;
-                }
-
-                self.walk(arena, symtab, *body)?;
-
-                Ok(())
-            }
-
-            AstKind::Continue { .. } => {
-                let scope = arena[id].scope;
-                if symtab.upto(scope, ScopeKind::Loop).is_some() {
+            AstKind::Identifier { name, .. } => {
+                if resolve(&stage.symtab, &stage.arena, &id).is_some() {
                     Ok(())
                 } else {
-                    Err(error(Semantic(SemanticError::ContinueNotInALoop)))
+                    Err(stage.arena.node_error(
+                        id,
+                        Parsing(ParsingError::UndeclaredIdentifier(
+                            stage.arena.token_str(name).to_string(),
+                        )),
+                    ))
                 }
             }
 
-            AstKind::Break { .. } => {
-                let scope = arena[id].scope;
-                if symtab
-                    .upto_any(scope, &[ScopeKind::Loop, ScopeKind::Switch])
-                    .is_some()
-                {
+            AstKind::Assign { left, .. }
+            | AstKind::CompoundAssign { left, .. } => {
+                if !is_lvalue(&stage.arena, *left) {
+                    Err(stage
+                        .arena
+                        .node_error(id, Semantic(SemanticError::NotAnLvalue)))
+                } else {
+                    Ok(())
+                }
+            }
+
+            AstKind::AddrOf { expr } => {
+                if !is_lvalue(&stage.arena, *expr) {
+                    Err(stage
+                        .arena
+                        .node_error(id, Semantic(SemanticError::NotAnLvalue)))
+                } else {
+                    Ok(())
+                }
+            }
+
+            AstKind::Case { .. } => {
+                let scope = stage.arena[id].scope;
+                if stage.symtab.upto(scope, ScopeKind::Switch).is_some() {
                     Ok(())
                 } else {
-                    Err(error(Semantic(SemanticError::BreakNotInALoopOrSwitch)))
+                    Err(stage.arena.node_error(
+                        id,
+                        Semantic(SemanticError::CaseOutsideOfSwitch),
+                    ))
                 }
             }
-            AstKind::ExprStmt { expr } => {
-                let expr_val = *expr;
-                check(arena, symtab, expr_val)?;
-                let folded = fold(arena, expr_val);
-                arena[expr_val] = arena[folded].clone();
-                Ok(())
-            }
-            AstKind::GoTo { label } => {
-                let scope = arena[id].scope;
-                if symtab.get_label(scope, arena.token_str(label)).is_some() {
+
+            AstKind::Default { .. } => {
+                let scope = stage.arena[id].scope;
+                if stage.symtab.upto(scope, ScopeKind::Switch).is_some() {
                     Ok(())
                 } else {
-                    Err(error(Semantic(SemanticError::LabelNotFound(
-                        arena.token_str(label).to_string(),
-                    ))))
+                    Err(stage.arena.node_error(
+                        id,
+                        Semantic(SemanticError::DefaultOutsideOfSwitch),
+                    ))
                 }
-            }
-
-            AstKind::Label { stmt, .. } => {
-                self.walk(arena, symtab, *stmt)?;
-                Ok(())
-            }
-
-            AstKind::Case { expr, stmt, idx: _ } => {
-                let scope = arena[id].scope;
-                if symtab.upto(scope, ScopeKind::Switch).is_some() {
-                    let expr_val = *expr;
-                    check(arena, symtab, expr_val)?;
-                    let folded = fold(arena, expr_val);
-                    arena[expr_val] = arena[folded].clone();
-
-                    if !is_const_int_expr(arena, expr_val)
-                        && !is_const_unsigned_int_expr(arena, expr_val)
-                    {
-                        return Err(error(Semantic(
-                            SemanticError::NotAConstExpression,
-                        )));
-                    }
-
-                    self.walk(arena, symtab, *stmt)?;
-
-                    return Ok(());
-                }
-
-                Err(error(Semantic(SemanticError::CaseOutsideOfSwitch)))
-            }
-
-            AstKind::Default { stmt } => {
-                let scope = arena[id].scope;
-                if symtab.upto(scope, ScopeKind::Switch).is_some() {
-                    self.walk(arena, symtab, *stmt)?;
-                    return Ok(());
-                }
-
-                Err(error(Semantic(SemanticError::DefaultOutsideOfSwitch)))
-            }
-
-            AstKind::Switch { cond, body, cases } => {
-                let cond_val = *cond;
-                check(arena, symtab, cond_val)?;
-                let folded = fold(arena, cond_val);
-                arena[cond_val] = arena[folded].clone();
-                self.walk(arena, symtab, *body)?;
-                let mut case_values: HashSet<u64> = HashSet::new();
-                let mut has_default = false;
-                for &case in cases {
-                    let case_kind = arena[case].kind.clone();
-                    match &case_kind {
-                        AstKind::Case { expr, stmt, .. } => {
-                            if is_const_unsigned_int_expr(arena, *expr) {
-                                if !case_values.insert(
-                                    const_unsigned_int_value(arena, *expr),
-                                ) {
-                                    return Err(error(Semantic(
-                                        SemanticError::DuplicateCaseExpression,
-                                    )));
-                                }
-                            } else if is_const_int_expr(arena, *expr) {
-                                if !case_values
-                                    .insert(const_int_value(arena, *expr) as u64)
-                                {
-                                    return Err(error(Semantic(
-                                        SemanticError::DuplicateCaseExpression,
-                                    )));
-                                }
-                            } else {
-                                return Err(error(Semantic(
-                                    SemanticError::NotAConstExpression,
-                                )));
-                            }
-
-                            self.walk(arena, symtab, *stmt)?;
-                        }
-                        AstKind::Default { stmt } => {
-                            if has_default {
-                                return Err(error(Semantic(
-                                    SemanticError::DuplicateDefaultCase,
-                                )));
-                            }
-                            has_default = true;
-                            self.walk(arena, symtab, *stmt)?;
-                        }
-                        _ => unreachable!(),
-                    }
-                }
-                Ok(())
-            }
-            AstKind::EmptyStmt => Ok(()),
-
-            AstKind::Initialiser {
-                type_spec: _,
-                value,
-            } => {
-                if let Some(expr) = value {
-                    let expr_val = *expr;
-                    check(arena, symtab, expr_val)?;
-                    let folded = fold(arena, expr_val);
-                    arena[expr_val] = arena[folded].clone();
-                }
-                Ok(())
             }
 
             _ => Ok(()),
         }
     }
 
-    pub fn run(&self, stage: &mut AstStage) -> Result<(), Error> {
-        for &node in &stage.root {
-            self.walk(&mut stage.arena, &stage.symtab, node)?;
+    fn visit_break(
+        &mut self,
+        stage: &mut AstStage<'_>,
+        id: AstId,
+    ) -> Result<(), Error> {
+        let scope = stage.arena[id].scope;
+        if stage
+            .symtab
+            .upto_any(scope, &[ScopeKind::Loop, ScopeKind::Switch])
+            .is_some()
+        {
+            Ok(())
+        } else {
+            Err(stage.arena.node_error(
+                id,
+                Semantic(SemanticError::BreakNotInALoopOrSwitch),
+            ))
+        }
+    }
+
+    fn visit_continue(
+        &mut self,
+        stage: &mut AstStage<'_>,
+        id: AstId,
+    ) -> Result<(), Error> {
+        let scope = stage.arena[id].scope;
+        if stage.symtab.upto(scope, ScopeKind::Loop).is_some() {
+            Ok(())
+        } else {
+            Err(stage
+                .arena
+                .node_error(id, Semantic(SemanticError::ContinueNotInALoop)))
+        }
+    }
+
+    fn visit_goto(
+        &mut self,
+        stage: &mut AstStage<'_>,
+        id: AstId,
+    ) -> Result<(), Error> {
+        if let AstKind::GoTo { label } = &stage.arena[id].kind {
+            let scope = stage.arena[id].scope;
+            let name = stage.arena.token_str(label).to_string();
+            if stage.symtab.get_label(scope, &name).is_some() {
+                Ok(())
+            } else {
+                Err(stage.arena.node_error(
+                    id,
+                    Semantic(SemanticError::LabelNotFound(name)),
+                ))
+            }
+        } else {
+            Ok(())
+        }
+    }
+
+    fn visit_variable(
+        &mut self,
+        stage: &mut AstStage<'_>,
+        id: AstId,
+    ) -> Result<(), Error> {
+        if let AstKind::Variable { init, .. } = &stage.arena[id].kind
+            && let Some(init) = init
+            && let Some(sym) = resolve(&stage.symtab, &stage.arena, &id)
+            && has_static_storage_duration(&stage.symtab, sym)
+            && !is_const_expr(&stage.arena, *init)
+        {
+            return Err(stage
+                .arena
+                .node_error(id, Semantic(SemanticError::NotAConstExpression)));
         }
 
         Ok(())
+    }
+
+    fn visit_case(
+        &mut self,
+        stage: &mut AstStage<'_>,
+        id: AstId,
+    ) -> Result<(), Error> {
+        if let AstKind::Case { expr, .. } = &stage.arena[id].kind {
+            let expr = *expr;
+            if !is_const_int_expr(&stage.arena, expr)
+                && !is_const_unsigned_int_expr(&stage.arena, expr)
+            {
+                return Err(stage.arena.node_error(
+                    id,
+                    Semantic(SemanticError::NotAConstExpression),
+                ));
+            }
+        }
+
+        Ok(())
+    }
+
+    fn visit_switch(
+        &mut self,
+        stage: &mut AstStage<'_>,
+        id: AstId,
+    ) -> Result<(), Error> {
+        let cases = if let AstKind::Switch { cases, .. } = &stage.arena[id].kind
+        {
+            cases.clone()
+        } else {
+            unreachable!()
+        };
+
+        let mut case_values: HashSet<u64> = HashSet::new();
+        let mut has_default = false;
+
+        for &case in &cases {
+            let case_kind = stage.arena[case].kind.clone();
+            match &case_kind {
+                AstKind::Case { expr, .. } => {
+                    if is_const_unsigned_int_expr(&stage.arena, *expr) {
+                        if !case_values.insert(const_unsigned_int_value(
+                            &stage.arena,
+                            *expr,
+                        )) {
+                            return Err(stage.arena.node_error(
+                                id,
+                                Semantic(
+                                    SemanticError::DuplicateCaseExpression,
+                                ),
+                            ));
+                        }
+                    } else if is_const_int_expr(&stage.arena, *expr) {
+                        if !case_values
+                            .insert(const_int_value(&stage.arena, *expr) as u64)
+                        {
+                            return Err(stage.arena.node_error(
+                                id,
+                                Semantic(
+                                    SemanticError::DuplicateCaseExpression,
+                                ),
+                            ));
+                        }
+                    } else {
+                        return Err(stage.arena.node_error(
+                            id,
+                            Semantic(SemanticError::NotAConstExpression),
+                        ));
+                    }
+                }
+                AstKind::Default { .. } => {
+                    if has_default {
+                        return Err(stage.arena.node_error(
+                            id,
+                            Semantic(SemanticError::DuplicateDefaultCase),
+                        ));
+                    }
+                    has_default = true;
+                }
+                _ => unreachable!(),
+            }
+        }
+
+        Ok(())
+    }
+
+    fn visit_call(
+        &mut self,
+        stage: &mut AstStage<'_>,
+        id: AstId,
+    ) -> Result<(), Error> {
+        if let AstKind::Call { expr, .. } = &stage.arena[id].kind {
+            let callee = *expr;
+            if !is_callable(&stage.arena, &stage.symtab, callee) {
+                return Err(stage
+                    .arena
+                    .node_error(id, Semantic(SemanticError::NotAFunction)));
+            }
+        }
+
+        Ok(())
+    }
+
+    fn visit_pre_incr(
+        &mut self,
+        stage: &mut AstStage<'_>,
+        id: AstId,
+    ) -> Result<(), Error> {
+        self.check_lvalue(stage, id)
+    }
+
+    fn visit_pre_decr(
+        &mut self,
+        stage: &mut AstStage<'_>,
+        id: AstId,
+    ) -> Result<(), Error> {
+        self.check_lvalue(stage, id)
+    }
+
+    fn visit_post_incr(
+        &mut self,
+        stage: &mut AstStage<'_>,
+        id: AstId,
+    ) -> Result<(), Error> {
+        self.check_lvalue(stage, id)
+    }
+
+    fn visit_post_decr(
+        &mut self,
+        stage: &mut AstStage<'_>,
+        id: AstId,
+    ) -> Result<(), Error> {
+        self.check_lvalue(stage, id)
+    }
+}
+
+impl Analyser {
+    fn check_lvalue(
+        &self,
+        stage: &mut AstStage<'_>,
+        id: AstId,
+    ) -> Result<(), Error> {
+        let inner = match &stage.arena[id].kind {
+            AstKind::PreIncr { expr }
+            | AstKind::PreDecr { expr }
+            | AstKind::PostIncr { expr }
+            | AstKind::PostDecr { expr } => *expr,
+            _ => unreachable!(),
+        };
+
+        if !is_lvalue(&stage.arena, inner) {
+            Err(stage
+                .arena
+                .node_error(id, Semantic(SemanticError::NotAnLvalue)))
+        } else {
+            Ok(())
+        }
+    }
+}
+
+impl Default for Analyser {
+    fn default() -> Self {
+        Self::new()
     }
 }

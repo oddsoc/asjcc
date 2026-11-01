@@ -24,15 +24,19 @@
 use std::cell::Cell;
 
 use crate::ast::*;
-use crate::errors::{Error, ErrorClass::Parsing, ParsingError, error};
+use crate::errors::{
+    Error,
+    ErrorClass::{Parsing, Tokenising},
+    ParsingError, error, error_at,
+};
 use crate::expr::*;
-use crate::lexing::{Token, TokenTag as Tag, Tokeniser};
 use crate::symtab::*;
+use crate::tokenising::{Token, TokenTag as Tag, Tokeniser};
 use crate::types::*;
 
 macro_rules! accept {
     ($parser:expr, $tag:path) => {
-        if let Some(token) = &$parser.tokens[1] {
+        if let Some(token) = &$parser.state.tokens[1] {
             if matches!(token.tag, $tag) {
                 #[cfg(feature = "tracing")]
                 println!("  {}", token.as_str($parser.buf));
@@ -47,7 +51,7 @@ macro_rules! accept {
     };
 
     ($parser:expr, $tag:path, $_:tt) => {
-        if let Some(token) = &$parser.tokens[1] {
+        if let Some(token) = &$parser.state.tokens[1] {
             if matches!(token.tag, $tag(_)) {
                 #[cfg(feature = "tracing")]
                 println!("  {}", token.as_str($parser.buf));
@@ -64,47 +68,47 @@ macro_rules! accept {
 
 macro_rules! expect {
     ($parser:expr, $tag:path) => {
-        if let Some(token) = &$parser.tokens[1] {
+        if let Some(token) = &$parser.state.tokens[1] {
             if !matches!(token.tag, $tag) {
-                return Err(error(Parsing(ParsingError::ExpectedButGot {
-                    expected: stringify!($tag).to_string(),
-                    got: format!("{:?}", token.tag),
-                })));
+                return Err(error_at(
+                    token.loc,
+                    Parsing(ParsingError::ExpectedTokButGot(
+                        token.tag.to_string(),
+                    )),
+                ));
             } else {
                 #[cfg(feature = "tracing")]
                 println!("  {}", token.as_str($parser.buf));
                 $parser.advance()?;
             }
         } else {
-            return Err(error(Parsing(ParsingError::ExpectedButReachedEof(
-                stringify!($tag).to_string(),
-            ))));
+            return Err(error(Parsing(ParsingError::UnexpectedEof)));
         }
     };
 
     ($parser:expr, $tag:path, $_:tt) => {
-        if let Some(token) = &$parser.tokens[1] {
+        if let Some(token) = &$parser.state.tokens[1] {
             if !matches!(token.tag, $tag(_)) {
-                return Err(error(Parsing(ParsingError::ExpectedButGot {
-                    expected: stringify!($tag).to_string(),
-                    got: format!("{:?}", token.tag),
-                })));
+                return Err(error_at(
+                    token.loc,
+                    Parsing(ParsingError::ExpectedTokButGot(
+                        token.tag.to_string(),
+                    )),
+                ));
             } else {
                 #[cfg(feature = "tracing")]
                 println!("  {}", token.as_str($parser.buf));
                 $parser.advance()?;
             }
         } else {
-            return Err(error(Parsing(ParsingError::ExpectedButReachedEof(
-                stringify!($tag).to_string(),
-            ))));
+            return Err(error(Parsing(ParsingError::UnexpectedEof)));
         }
     };
 }
 
 macro_rules! peek {
     ($parser:expr, $tag:path) => {
-        if let Some(token) = &$parser.tokens[1] {
+        if let Some(token) = &$parser.state.tokens[1] {
             if matches!(token.tag, $tag) {
                 true
             } else {
@@ -116,7 +120,7 @@ macro_rules! peek {
     };
 
     ($parser:expr, $tag:path, $_:tt) => {
-        if let Some(token) = &$parser.tokens[1] {
+        if let Some(token) = &$parser.state.tokens[1] {
             if matches!(token.tag, $tag(_)) {
                 true
             } else {
@@ -130,7 +134,7 @@ macro_rules! peek {
 
 macro_rules! peek2 {
     ($parser:expr, $tag:path) => {
-        if let Some(token) = &$parser.tokens[2] {
+        if let Some(token) = &$parser.state.tokens[2] {
             if matches!(token.tag, $tag) {
                 true
             } else {
@@ -142,7 +146,7 @@ macro_rules! peek2 {
     };
 
     ($parser:expr, $tag:path, $_:tt) => {
-        if let Some(token) = $parser.tokens[2] {
+        if let Some(token) = $parser.state.tokens[2] {
             if matches!(token.tag, $tag(_)) {
                 true
             } else {
@@ -156,7 +160,7 @@ macro_rules! peek2 {
 
 macro_rules! peek_tag {
     ($parser:expr) => {
-        if let Some(token) = &$parser.tokens[1] {
+        if let Some(token) = &$parser.state.tokens[1] {
             token.tag.clone()
         } else {
             Tag::End
@@ -166,7 +170,7 @@ macro_rules! peek_tag {
 
 macro_rules! yank {
     ($parser:expr, $tag:path) => {
-        if let Some(token) = &$parser.tokens[0] {
+        if let Some(token) = &$parser.state.tokens[0] {
             match &token.tag {
                 $tag(data) => data.clone(),
                 _ => panic!(
@@ -181,26 +185,22 @@ macro_rules! yank {
     };
 }
 
-pub struct Parser<'buf, 'sym> {
-    buf: &'buf str,
+#[derive(Clone)]
+struct ParserState<'buf> {
     tokeniser: Tokeniser<'buf>,
     tokens: [Option<Token>; 3],
     fn_param: bool,
     backtracking: bool,
     scope: ScopeId,
-    arena: AstArena,
-    symtab: &'sym mut SymTab,
     cases: Vec<Vec<AstId>>,
+    errors: Vec<Error>,
 }
 
-#[derive(Clone)]
-struct ParserSnapshot<'buf> {
-    tokeniser: Tokeniser<'buf>,
-    tokens: [Option<Token>; 3],
-    fn_param: bool,
-    backtracking: bool,
-    scope: ScopeId,
-    cases: Vec<Vec<AstId>>,
+pub struct Parser<'buf, 'sym> {
+    buf: &'buf str,
+    state: ParserState<'buf>,
+    arena: AstArena<'buf>,
+    symtab: &'sym mut SymTab,
 }
 
 fn precedence_of(tag: &Tag) -> i32 {
@@ -237,15 +237,18 @@ impl<'buf, 'sym> Parser<'buf, 'sym> {
         symtab: &'sym mut SymTab,
     ) -> Result<Self, Error> {
         let mut parser = Self {
-            buf: buf,
-            tokeniser: Tokeniser::new(buf),
-            tokens: [None, None, None],
-            fn_param: false,
-            backtracking: false,
-            scope: ScopeId(0),
-            arena: AstArena::new(),
+            buf,
+            state: ParserState {
+                tokeniser: Tokeniser::new(buf),
+                tokens: [None, None, None],
+                fn_param: false,
+                backtracking: false,
+                scope: ScopeId(0),
+                cases: vec![],
+                errors: vec![],
+            },
+            arena: AstArena::new(buf),
             symtab,
-            cases: vec![],
         };
 
         parser.preload()?;
@@ -254,46 +257,31 @@ impl<'buf, 'sym> Parser<'buf, 'sym> {
     }
 
     fn open_scope(&mut self, tag: ScopeKind) {
-        let new_scope = self.symtab.open_scope(self.scope, tag);
-        self.scope = new_scope;
+        let new_scope = self.symtab.open_scope(self.state.scope, tag);
+        self.state.scope = new_scope;
     }
 
     fn close_scope(&mut self) {
-        self.scope = self.symtab.close_scope(self.scope);
+        self.state.scope = self.symtab.close_scope(self.state.scope);
     }
 
     fn alloc(&mut self, kind: AstKind) -> AstId {
-        self.arena.alloc(kind, None, self.scope)
+        self.arena.alloc(kind, None, self.state.scope)
     }
 
-    pub fn parse(&mut self) -> Result<(AstArena, Vec<AstId>), Error> {
-        let top = self.translation_unit()?;
-        let arena = std::mem::replace(&mut self.arena, AstArena::new());
+    pub fn parse(
+        &mut self,
+    ) -> Result<(AstArena<'buf>, Vec<AstId>), Vec<Error>> {
+        let top = self.translation_unit().map_err(|e| {
+            let mut errors = self.state.errors.clone();
+            if errors.is_empty() {
+                errors.push(e);
+            }
+            errors
+        })?;
+        let buf = self.buf;
+        let arena = std::mem::replace(&mut self.arena, AstArena::new(buf));
         Ok((arena, top))
-    }
-
-    fn save_state(&self) -> ParserSnapshot<'buf> {
-        ParserSnapshot {
-            tokeniser: self.tokeniser.clone(),
-            tokens: self.tokens.clone(),
-            fn_param: self.fn_param,
-            backtracking: self.backtracking,
-            scope: self.scope,
-            cases: self.cases.clone(),
-        }
-    }
-
-    fn get_state(&self) -> ParserSnapshot<'buf> {
-        self.save_state()
-    }
-
-    fn restore_state(&mut self, state: &ParserSnapshot<'buf>) {
-        self.tokeniser = state.tokeniser.clone();
-        self.tokens = state.tokens.clone();
-        self.fn_param = state.fn_param;
-        self.backtracking = state.backtracking;
-        self.scope = state.scope;
-        self.cases = state.cases.clone();
     }
 
     #[cfg_attr(feature = "tracing", tracing::instrument(skip_all))]
@@ -301,10 +289,42 @@ impl<'buf, 'sym> Parser<'buf, 'sym> {
         let mut prog: Vec<AstId> = vec![];
 
         while !self.eof() {
-            prog.extend(self.declaration()?);
+            match self.declaration() {
+                Ok(decls) => prog.extend(decls),
+                Err(e) => {
+                    if matches!(e.class, Tokenising(_)) {
+                        return Err(e);
+                    }
+                    self.state.errors.push(e);
+                    self.skip_to_semicolon();
+                }
+            }
+        }
+
+        if let Some(e) = self.state.errors.first().cloned() {
+            return Err(e);
         }
 
         Ok(prog)
+    }
+
+    fn skip_to_semicolon(&mut self) {
+        while !self.eof() {
+            if let Some(token) = &self.state.tokens[1]
+                && matches!(token.tag, Tag::Semicolon)
+            {
+                let _ = self.advance();
+                return;
+            }
+            if self.advance().is_err() {
+                return;
+            }
+        }
+    }
+
+    #[allow(unused)]
+    pub fn errors(&self) -> &[Error] {
+        &self.state.errors
     }
 
     #[cfg_attr(feature = "tracing", tracing::instrument(skip_all))]
@@ -333,7 +353,7 @@ impl<'buf, 'sym> Parser<'buf, 'sym> {
     ) -> Result<AstId, Error> {
         Ok(self.alloc(AstKind::Pointer {
             base_type_spec: type_spec,
-            qualifiers: qualifiers,
+            qualifiers,
         }))
     }
 
@@ -383,7 +403,7 @@ impl<'buf, 'sym> Parser<'buf, 'sym> {
             let array = self.array(type_spec)?;
 
             if let Some(ident) = &name {
-                self.variable(array, storage_class, ident.clone())
+                self.variable(array, storage_class, *ident)
             } else {
                 Ok(array)
             }
@@ -391,24 +411,25 @@ impl<'buf, 'sym> Parser<'buf, 'sym> {
             if let AstKind::Function { name, sym, .. } =
                 &mut self.arena[type_spec].kind
             {
-                if !self.backtracking {
-                    let s = self.symtab.declare_sym(
-                        self.scope,
-                        &ident.as_str(self.buf),
-                        SymKind::Function,
+                if !self.state.backtracking {
+                    let s = self.symtab.declare_sym(SymDecl {
+                        id: self.state.scope,
+                        name: ident.as_str(self.buf),
+                        kind: SymKind::Function,
                         storage_class,
-                        None,
-                        Some(type_spec),
-                    )?;
+                        definition: None,
+                        node: Some(type_spec),
+                        token: *ident,
+                    })?;
 
                     *sym = Some(s);
                 }
 
-                *name = Some(ident.clone());
+                *name = Some(*ident);
 
                 Ok(type_spec)
             } else {
-                self.variable(type_spec, storage_class, ident.clone())
+                self.variable(type_spec, storage_class, *ident)
             }
         } else {
             Ok(type_spec)
@@ -416,16 +437,16 @@ impl<'buf, 'sym> Parser<'buf, 'sym> {
     }
 
     fn skip_declarator(&mut self, allow_name: bool) -> Result<(), Error> {
-        let scope = self.scope;
+        let scope = self.state.scope;
         self.open_scope(ScopeKind::Block);
         let tmp_type_spec = self.alloc(AstKind::Void);
-        let backtracking = self.backtracking;
-        self.backtracking = true;
+        let backtracking = self.state.backtracking;
+        self.state.backtracking = true;
         self.declarator(tmp_type_spec, None, allow_name)?;
-        self.backtracking = backtracking;
+        self.state.backtracking = backtracking;
 
         loop {
-            if self.scope == scope {
+            if self.state.scope == scope {
                 break;
             } else {
                 self.close_scope();
@@ -435,12 +456,18 @@ impl<'buf, 'sym> Parser<'buf, 'sym> {
         Ok(())
     }
 
-    fn set_state(&mut self, state: &ParserSnapshot<'buf>) {
-        let arena = std::mem::replace(&mut self.arena, AstArena::new());
-        let scope = self.scope;
-        self.restore_state(state);
+    #[inline]
+    fn snapshot(&self) -> ParserState<'buf> {
+        self.state.clone()
+    }
+
+    fn restore_state(&mut self, state: &ParserState<'buf>) {
+        let buf = self.buf;
+        let arena = std::mem::replace(&mut self.arena, AstArena::new(buf));
+        let scope = self.state.scope;
+        self.state = state.clone();
         self.arena = arena;
-        self.scope = scope;
+        self.state.scope = scope;
     }
 
     #[cfg_attr(feature = "tracing", tracing::instrument(skip_all))]
@@ -454,7 +481,7 @@ impl<'buf, 'sym> Parser<'buf, 'sym> {
         let mut name: Option<Token> = None;
 
         if accept!(self, Tag::LeftParen) {
-            let start = self.get_state();
+            let start = self.snapshot();
             self.skip_declarator(allow_name)?;
 
             expect!(self, Tag::RightParen);
@@ -462,14 +489,14 @@ impl<'buf, 'sym> Parser<'buf, 'sym> {
             inner_type_spec =
                 self.type_suffix(inner_type_spec, storage_class, None)?;
 
-            let end = self.get_state();
+            let end = self.snapshot();
 
-            self.set_state(&start);
+            self.restore_state(&start);
 
             let decl =
                 self.declarator(inner_type_spec, storage_class, allow_name)?;
 
-            self.set_state(&end);
+            self.restore_state(&end);
 
             return Ok(decl);
         }
@@ -480,11 +507,11 @@ impl<'buf, 'sym> Parser<'buf, 'sym> {
                     ParsingError::AbstractDeclaratorCannotHaveIdentifier,
                 )));
             }
-            name = Some(self.tokens[0].as_ref().unwrap().clone());
+            name = Some(*self.state.tokens[0].as_ref().unwrap());
         }
 
         inner_type_spec =
-            self.type_suffix(inner_type_spec, storage_class, name.clone())?;
+            self.type_suffix(inner_type_spec, storage_class, name)?;
 
         Ok(inner_type_spec)
     }
@@ -554,7 +581,7 @@ impl<'buf, 'sym> Parser<'buf, 'sym> {
                 type_spec: _elem_type_spec,
                 dimension,
                 len: _,
-            } => dimension.clone(),
+            } => *dimension,
             _ => unreachable!(),
         };
 
@@ -566,9 +593,9 @@ impl<'buf, 'sym> Parser<'buf, 'sym> {
 
         Ok(
             self.alloc(AstKind::CompoundInitialiser(CompoundInitialiser {
-                type_spec: type_spec,
+                type_spec,
                 initialisers: Vec::new(),
-                max_initialisers: max_initialisers,
+                max_initialisers,
             })),
         )
     }
@@ -582,7 +609,7 @@ impl<'buf, 'sym> Parser<'buf, 'sym> {
                 self.build_initialiser_for_array(type_spec)
             }
             _ => Ok(self.alloc(AstKind::Initialiser {
-                type_spec: type_spec,
+                type_spec,
                 value: None,
             })),
         }
@@ -613,14 +640,22 @@ impl<'buf, 'sym> Parser<'buf, 'sym> {
                 self.close_scope();
             }
             AstKind::Variable {
-                type_spec: ts, sym, ..
+                type_spec: ts,
+                sym,
+                name,
+                ..
             } => {
                 let ts = *ts;
                 let definition = self.determine_definition_type(storage_class);
                 let s = *sym;
 
                 if let Some(s) = s {
-                    self.symtab.update_sym(self.scope, s, definition)?;
+                    self.symtab.update_sym(
+                        self.state.scope,
+                        s,
+                        definition,
+                        *name,
+                    )?;
                 }
 
                 let initialiser = self.build_initialiser_for(ts)?;
@@ -660,15 +695,15 @@ impl<'buf, 'sym> Parser<'buf, 'sym> {
 
             decls.push(decl);
 
-            if let AstKind::Function { block, .. } = &self.arena[decl].kind {
-                if block.is_some() {
-                    if decls.len() > 1 {
-                        return Err(error(Parsing(
+            if let AstKind::Function { block, .. } = &self.arena[decl].kind
+                && block.is_some()
+            {
+                if decls.len() > 1 {
+                    return Err(error(Parsing(
                             ParsingError::ADeclaratorListCannotContainFunctionDefinition,
                         )));
-                    } else {
-                        return Ok(decls);
-                    }
+                } else {
+                    return Ok(decls);
                 }
             }
 
@@ -820,7 +855,13 @@ impl<'buf, 'sym> Parser<'buf, 'sym> {
             }
         }
 
-        if type_specs.len() < 1 {
+        if type_specs.is_empty() {
+            if let Some(tok) = &self.state.tokens[1] {
+                return Err(error_at(
+                    tok.loc,
+                    Parsing(ParsingError::InvalidTypeSpecifier),
+                ));
+            }
             return Err(error(Parsing(ParsingError::InvalidTypeSpecifier)));
         }
 
@@ -842,7 +883,7 @@ impl<'buf, 'sym> Parser<'buf, 'sym> {
         let mut params: Vec<AstId> = vec![];
         expect!(self, Tag::LeftParen);
 
-        self.fn_param = true;
+        self.state.fn_param = true;
 
         if !accept!(self, Tag::RightParen) {
             if accept!(self, Tag::Void) {
@@ -860,7 +901,7 @@ impl<'buf, 'sym> Parser<'buf, 'sym> {
             }
         }
 
-        self.fn_param = false;
+        self.state.fn_param = false;
 
         Ok(params)
     }
@@ -891,28 +932,29 @@ impl<'buf, 'sym> Parser<'buf, 'sym> {
         let mut sym: Option<SymId> = None;
 
         if let Some(ident) = &name
-            && !self.backtracking
+            && !self.state.backtracking
         {
-            sym = Some(self.symtab.declare_sym(
-                self.symtab.parent_of(self.scope),
-                &ident.as_str(self.buf),
-                SymKind::Function,
+            sym = Some(self.symtab.declare_sym(SymDecl {
+                id: self.symtab.parent_of(self.state.scope),
+                name: ident.as_str(self.buf),
+                kind: SymKind::Function,
                 storage_class,
-                if peek!(self, Tag::LeftBrace) {
+                definition: if peek!(self, Tag::LeftBrace) {
                     Some(Definition::Concrete)
                 } else {
                     None
                 },
-                None,
-            )?);
+                node: None,
+                token: *ident,
+            })?);
         }
 
         let decl = self.alloc(AstKind::Function {
-            name: name.clone(),
-            sym: sym,
-            params: params.clone(),
+            name,
+            sym,
+            params,
             block: None,
-            type_spec: type_spec,
+            type_spec,
         });
 
         if let Some(sym) = sym {
@@ -932,7 +974,7 @@ impl<'buf, 'sym> Parser<'buf, 'sym> {
             Some(Definition::Tentative)
         } else if let Some(StorageClass::Extern) = storage_class {
             None
-        } else if !self.symtab.has_parent(self.scope) {
+        } else if !self.symtab.has_parent(self.state.scope) {
             Some(Definition::Tentative)
         } else {
             None
@@ -943,7 +985,7 @@ impl<'buf, 'sym> Parser<'buf, 'sym> {
         &mut self,
         elem_type_spec: AstId,
     ) -> Result<usize, Error> {
-        let state = self.save_state();
+        let state = self.snapshot();
 
         let mut count = 0usize;
         let mut first = true;
@@ -1240,30 +1282,31 @@ impl<'buf, 'sym> Parser<'buf, 'sym> {
         storage_class: Option<StorageClass>,
         name: Token,
     ) -> Result<AstId, Error> {
-        let sym = if !self.backtracking {
-            Some(self.symtab.declare_sym(
-                self.scope,
-                &name.as_str(self.buf),
-                SymKind::Variable,
+        let sym = if !self.state.backtracking {
+            Some(self.symtab.declare_sym(SymDecl {
+                id: self.state.scope,
+                name: name.as_str(self.buf),
+                kind: SymKind::Variable,
                 storage_class,
-                None,
-                None,
-            )?)
+                definition: None,
+                node: None,
+                token: name,
+            })?)
         } else {
             None
         };
 
-        let var = if self.fn_param {
+        let var = if self.state.fn_param {
             self.alloc(AstKind::Parameter {
-                name: name.clone(),
-                sym: sym,
-                type_spec: type_spec,
+                name,
+                sym,
+                type_spec,
             })
         } else {
             self.alloc(AstKind::Variable {
-                name: name.clone(),
-                sym: sym,
-                type_spec: type_spec,
+                name,
+                sym,
+                type_spec,
                 init: None,
             })
         };
@@ -1276,15 +1319,15 @@ impl<'buf, 'sym> Parser<'buf, 'sym> {
     }
 
     fn is_type_spec(&self) -> bool {
-        match peek_tag!(self) {
+        matches!(
+            peek_tag!(self),
             Tag::Unsigned
-            | Tag::Signed
-            | Tag::Int
-            | Tag::Long
-            | Tag::Double
-            | Tag::Void => true,
-            _ => false,
-        }
+                | Tag::Signed
+                | Tag::Int
+                | Tag::Long
+                | Tag::Double
+                | Tag::Void
+        )
     }
 
     fn is_type_qualifier(&self) -> bool {
@@ -1382,10 +1425,7 @@ impl<'buf, 'sym> Parser<'buf, 'sym> {
         let body = self.statement()?;
         self.close_scope();
 
-        Ok(self.alloc(AstKind::While {
-            cond: cond,
-            body: body,
-        }))
+        Ok(self.alloc(AstKind::While { cond, body }))
     }
 
     #[cfg_attr(feature = "tracing", tracing::instrument(skip_all))]
@@ -1400,10 +1440,7 @@ impl<'buf, 'sym> Parser<'buf, 'sym> {
         expect!(self, Tag::RightParen);
         expect!(self, Tag::Semicolon);
 
-        Ok(self.alloc(AstKind::DoWhile {
-            cond: cond,
-            body: body,
-        }))
+        Ok(self.alloc(AstKind::DoWhile { cond, body }))
     }
 
     #[cfg_attr(feature = "tracing", tracing::instrument(skip_all))]
@@ -1473,10 +1510,10 @@ impl<'buf, 'sym> Parser<'buf, 'sym> {
         self.close_scope();
 
         Ok(self.alloc(AstKind::For {
-            init: init,
-            cond: cond,
-            post: post,
-            body: body,
+            init,
+            cond,
+            post,
+            body,
         }))
     }
 
@@ -1487,17 +1524,17 @@ impl<'buf, 'sym> Parser<'buf, 'sym> {
         let expr = self.expr(0)?;
         expect!(self, Tag::RightParen);
 
-        self.cases.push(vec![]);
+        self.state.cases.push(vec![]);
         self.open_scope(ScopeKind::Switch);
         let stmt = self.statement()?;
         self.close_scope();
 
-        let cases = self.cases.pop().unwrap();
+        let cases = self.state.cases.pop().unwrap();
 
         Ok(self.alloc(AstKind::Switch {
             cond: expr,
             body: stmt,
-            cases: cases,
+            cases,
         }))
     }
 
@@ -1520,36 +1557,24 @@ impl<'buf, 'sym> Parser<'buf, 'sym> {
     #[cfg_attr(feature = "tracing", tracing::instrument(skip_all))]
     fn labelled_stmt(&mut self) -> Result<AstId, Error> {
         if accept!(self, Tag::Identifier) {
-            let label = self.tokens[0].as_ref().unwrap().clone();
+            let label = *self.state.tokens[0].as_ref().unwrap();
             expect!(self, Tag::Colon);
             let stmt = self.statement()?;
-            let l = self.symtab.add_label(
-                self.scope,
-                &label.as_str(self.buf),
+            self.symtab.add_label(
+                self.state.scope,
+                label.as_str(self.buf),
                 stmt,
-            );
+                label,
+            )?;
 
-            if l.is_err() {
-                return Err(error(Parsing(ParsingError::LabelAlreadyDefined(
-                    label.to_string(self.buf),
-                ))));
-            }
-
-            Ok(self.alloc(AstKind::Label {
-                name: label,
-                stmt: stmt,
-            }))
+            Ok(self.alloc(AstKind::Label { name: label, stmt }))
         } else if accept!(self, Tag::Case) {
             let expr = self.expr(0)?;
             expect!(self, Tag::Colon);
             let stmt = self.statement()?;
-            let case_stmt = self.alloc(AstKind::Case {
-                expr: expr,
-                stmt: stmt,
-                idx: 0,
-            });
+            let case_stmt = self.alloc(AstKind::Case { expr, stmt, idx: 0 });
 
-            if let Some(cases) = self.cases.last_mut() {
+            if let Some(cases) = self.state.cases.last_mut() {
                 cases.push(case_stmt);
             }
             Ok(case_stmt)
@@ -1557,8 +1582,8 @@ impl<'buf, 'sym> Parser<'buf, 'sym> {
             expect!(self, Tag::Default);
             expect!(self, Tag::Colon);
             let stmt = self.statement()?;
-            let dflt_stmt = self.alloc(AstKind::Default { stmt: stmt });
-            if let Some(cases) = self.cases.last_mut() {
+            let dflt_stmt = self.alloc(AstKind::Default { stmt });
+            if let Some(cases) = self.state.cases.last_mut() {
                 cases.push(dflt_stmt);
             }
             Ok(dflt_stmt)
@@ -1582,7 +1607,7 @@ impl<'buf, 'sym> Parser<'buf, 'sym> {
 
         self.close_scope();
 
-        Ok(self.alloc(AstKind::Block { body: body }))
+        Ok(self.alloc(AstKind::Block { body }))
     }
 
     #[cfg_attr(feature = "tracing", tracing::instrument(skip_all))]
@@ -1599,7 +1624,7 @@ impl<'buf, 'sym> Parser<'buf, 'sym> {
             }
         }
 
-        Ok(self.alloc(AstKind::Block { body: body }))
+        Ok(self.alloc(AstKind::Block { body }))
     }
 
     #[cfg_attr(feature = "tracing", tracing::instrument(skip_all))]
@@ -1616,9 +1641,9 @@ impl<'buf, 'sym> Parser<'buf, 'sym> {
         };
 
         Ok(self.alloc(AstKind::If {
-            cond: cond,
-            then: then,
-            otherwise: otherwise,
+            cond,
+            then,
+            otherwise,
         }))
     }
 
@@ -1626,10 +1651,10 @@ impl<'buf, 'sym> Parser<'buf, 'sym> {
     fn goto_stmt(&mut self) -> Result<AstId, Error> {
         expect!(self, Tag::GoTo);
         expect!(self, Tag::Identifier);
-        let label = self.tokens[0].as_ref().unwrap().clone();
+        let label = *self.state.tokens[0].as_ref().unwrap();
         expect!(self, Tag::Semicolon);
 
-        Ok(self.alloc(AstKind::GoTo { label: label }))
+        Ok(self.alloc(AstKind::GoTo { label }))
     }
 
     #[cfg_attr(feature = "tracing", tracing::instrument(skip_all))]
@@ -1637,13 +1662,13 @@ impl<'buf, 'sym> Parser<'buf, 'sym> {
         expect!(self, Tag::Return);
         let expr = self.expr(0)?;
         expect!(self, Tag::Semicolon);
-        Ok(self.alloc(AstKind::Return { expr: expr }))
+        Ok(self.alloc(AstKind::Return { expr }))
     }
 
     #[cfg_attr(feature = "tracing", tracing::instrument(skip_all))]
     fn expr_stmt(&mut self) -> Result<AstId, Error> {
         let expr = self.expr(0)?;
-        let stmt = self.alloc(AstKind::ExprStmt { expr: expr });
+        let stmt = self.alloc(AstKind::ExprStmt { expr });
         expect!(self, Tag::Semicolon);
         Ok(stmt)
     }
@@ -1660,8 +1685,8 @@ impl<'buf, 'sym> Parser<'buf, 'sym> {
 
         Ok(self.alloc(AstKind::Ternary {
             left: expr,
-            middle: middle,
-            right: right,
+            middle,
+            right,
         }))
     }
 
@@ -1688,10 +1713,7 @@ impl<'buf, 'sym> Parser<'buf, 'sym> {
     fn call(&mut self, expr: AstId) -> Result<AstId, Error> {
         let args = self.argument_list()?;
 
-        Ok(self.alloc(AstKind::Call {
-            expr: expr,
-            args: args,
-        }))
+        Ok(self.alloc(AstKind::Call { expr, args }))
     }
 
     #[cfg_attr(feature = "tracing", tracing::instrument(skip_all))]
@@ -1761,155 +1783,104 @@ impl<'buf, 'sym> Parser<'buf, 'sym> {
     }
 
     fn peek_binop(&self) -> bool {
-        match peek_tag!(self) {
+        matches!(
+            peek_tag!(self),
             Tag::Asterisk
-            | Tag::ForwardSlash
-            | Tag::Percent
-            | Tag::Plus
-            | Tag::Minus
-            | Tag::LeftShift
-            | Tag::RightShift
-            | Tag::Ampersand
-            | Tag::Bar
-            | Tag::Caret
-            | Tag::LAnd
-            | Tag::LOr
-            | Tag::Eq
-            | Tag::NotEq
-            | Tag::Less
-            | Tag::LessOrEq
-            | Tag::Greater
-            | Tag::GreaterOrEq
-            | Tag::PlusEq
-            | Tag::MinusEq
-            | Tag::MultEq
-            | Tag::DivideEq
-            | Tag::ModEq
-            | Tag::AndEq
-            | Tag::OrEq
-            | Tag::XorEq
-            | Tag::LeftShiftEq
-            | Tag::RightShiftEq
-            | Tag::Assign
-            | Tag::Question => true,
-            _ => false,
-        }
+                | Tag::ForwardSlash
+                | Tag::Percent
+                | Tag::Plus
+                | Tag::Minus
+                | Tag::LeftShift
+                | Tag::RightShift
+                | Tag::Ampersand
+                | Tag::Bar
+                | Tag::Caret
+                | Tag::LAnd
+                | Tag::LOr
+                | Tag::Eq
+                | Tag::NotEq
+                | Tag::Less
+                | Tag::LessOrEq
+                | Tag::Greater
+                | Tag::GreaterOrEq
+                | Tag::PlusEq
+                | Tag::MinusEq
+                | Tag::MultEq
+                | Tag::DivideEq
+                | Tag::ModEq
+                | Tag::AndEq
+                | Tag::OrEq
+                | Tag::XorEq
+                | Tag::LeftShiftEq
+                | Tag::RightShiftEq
+                | Tag::Assign
+                | Tag::Question
+        )
     }
 
     #[cfg_attr(feature = "tracing", tracing::instrument(skip_all))]
     fn binop(&mut self, left: AstId, prec: i32) -> Result<AstId, Error> {
         if accept!(self, Tag::Asterisk) {
             let right = self.expr(prec + 1)?;
-            Ok(self.alloc(AstKind::Multiply {
-                left: left,
-                right: right,
-            }))
+            Ok(self.alloc(AstKind::Multiply { left, right }))
         } else if accept!(self, Tag::ForwardSlash) {
             let right = self.expr(prec + 1)?;
-            return Ok(self.alloc(AstKind::Divide {
-                left: left,
-                right: right,
-            }));
+            Ok(self.alloc(AstKind::Divide { left, right }))
         } else if accept!(self, Tag::Percent) {
             let right = self.expr(prec + 1)?;
-            return Ok(self.alloc(AstKind::Modulo {
-                left: left,
-                right: right,
-            }));
+            Ok(self.alloc(AstKind::Modulo { left, right }))
         } else if accept!(self, Tag::Plus) {
             let right = self.expr(prec + 1)?;
-            return Ok(self.alloc(AstKind::Add {
-                left: left,
-                right: right,
-            }));
+            Ok(self.alloc(AstKind::Add { left, right }))
         } else if accept!(self, Tag::Minus) {
             let right = self.expr(prec + 1)?;
-            return Ok(self.alloc(AstKind::Subtract {
-                left: left,
-                right: right,
-            }));
+            Ok(self.alloc(AstKind::Subtract { left, right }))
         } else if accept!(self, Tag::LeftShift) {
             let right = self.expr(prec + 1)?;
-            return Ok(self.alloc(AstKind::LeftShift {
-                left: left,
-                right: right,
-            }));
+            Ok(self.alloc(AstKind::LeftShift { left, right }))
         } else if accept!(self, Tag::RightShift) {
             let right = self.expr(prec + 1)?;
-            return Ok(self.alloc(AstKind::RightShift {
-                left: left,
-                right: right,
-            }));
+            Ok(self.alloc(AstKind::RightShift { left, right }))
         } else if accept!(self, Tag::Ampersand) {
             let right = self.expr(prec + 1)?;
-            return Ok(self.alloc(AstKind::And {
-                left: left,
-                right: right,
-            }));
+            Ok(self.alloc(AstKind::And { left, right }))
         } else if accept!(self, Tag::Bar) {
             let right = self.expr(prec + 1)?;
-            return Ok(self.alloc(AstKind::Or {
-                left: left,
-                right: right,
-            }));
+            Ok(self.alloc(AstKind::Or { left, right }))
         } else if accept!(self, Tag::Caret) {
             let right = self.expr(prec + 1)?;
-            return Ok(self.alloc(AstKind::Xor {
-                left: left,
-                right: right,
-            }));
+            Ok(self.alloc(AstKind::Xor { left, right }))
         } else if accept!(self, Tag::LAnd) {
             let right = self.expr(prec + 1)?;
-            return Ok(self.alloc(AstKind::LogicAnd {
-                left: left,
-                right: right,
-            }));
+            Ok(self.alloc(AstKind::LogicAnd { left, right }))
         } else if accept!(self, Tag::LOr) {
             let right = self.expr(prec + 1)?;
-            return Ok(self.alloc(AstKind::LogicOr {
-                left: left,
-                right: right,
-            }));
+            Ok(self.alloc(AstKind::LogicOr { left, right }))
         } else if accept!(self, Tag::Eq) {
             let right = self.expr(prec + 1)?;
-            return Ok(self.alloc(AstKind::Equal {
-                left: left,
-                right: right,
-            }));
+            Ok(self.alloc(AstKind::Equal { left, right }))
         } else if accept!(self, Tag::NotEq) {
             let right = self.expr(prec + 1)?;
-            return Ok(self.alloc(AstKind::NotEq {
-                left: left,
-                right: right,
-            }));
+            Ok(self.alloc(AstKind::NotEq { left, right }))
         } else if accept!(self, Tag::Less) {
             let right = self.expr(prec + 1)?;
-            return Ok(self.alloc(AstKind::Less {
-                left: left,
-                right: right,
-            }));
+            Ok(self.alloc(AstKind::Less { left, right }))
         } else if accept!(self, Tag::LessOrEq) {
             let right = self.expr(prec + 1)?;
-            return Ok(self.alloc(AstKind::LessOrEq {
-                left: left,
-                right: right,
-            }));
+            Ok(self.alloc(AstKind::LessOrEq { left, right }))
         } else if accept!(self, Tag::Greater) {
             let right = self.expr(prec + 1)?;
-            return Ok(self.alloc(AstKind::Greater {
-                left: left,
-                right: right,
-            }));
+            Ok(self.alloc(AstKind::Greater { left, right }))
         } else if accept!(self, Tag::GreaterOrEq) {
             let right = self.expr(prec + 1)?;
-            return Ok(self.alloc(AstKind::GreaterOrEq {
-                left: left,
-                right: right,
-            }));
+            Ok(self.alloc(AstKind::GreaterOrEq { left, right }))
+        } else if let Some(tok) = &self.state.tokens[1] {
+            Err(error_at(
+                tok.loc,
+                Parsing(ParsingError::MalformedBinaryExpression),
+            ))
         } else {
-            return Err(error(Parsing(
-                ParsingError::MalformedBinaryExpression,
-            )));
+            Err(error(Parsing(ParsingError::MalformedBinaryExpression)))
         }
     }
 
@@ -1919,30 +1890,27 @@ impl<'buf, 'sym> Parser<'buf, 'sym> {
         left: AstId,
         right: AstId,
     ) -> Result<AstId, Error> {
-        Ok(self.alloc(AstKind::Assign {
-            left: left,
-            right: right,
-        }))
+        Ok(self.alloc(AstKind::Assign { left, right }))
     }
 
     #[cfg_attr(feature = "tracing", tracing::instrument(skip_all))]
     fn addr_of(&mut self, expr: AstId) -> Result<AstId, Error> {
-        Ok(self.alloc(AstKind::AddrOf { expr: expr }))
+        Ok(self.alloc(AstKind::AddrOf { expr }))
     }
 
     #[cfg_attr(feature = "tracing", tracing::instrument(skip_all))]
     fn deref(&mut self, expr: AstId) -> Result<AstId, Error> {
-        Ok(self.alloc(AstKind::Deref { expr: expr }))
+        Ok(self.alloc(AstKind::Deref { expr }))
     }
 
     #[cfg_attr(feature = "tracing", tracing::instrument(skip_all))]
     fn pre_incr(&mut self, expr: AstId) -> Result<AstId, Error> {
-        Ok(self.alloc(AstKind::PreIncr { expr: expr }))
+        Ok(self.alloc(AstKind::PreIncr { expr }))
     }
 
     #[cfg_attr(feature = "tracing", tracing::instrument(skip_all))]
     fn pre_decr(&mut self, expr: AstId) -> Result<AstId, Error> {
-        Ok(self.alloc(AstKind::PreDecr { expr: expr }))
+        Ok(self.alloc(AstKind::PreDecr { expr }))
     }
 
     #[cfg_attr(feature = "tracing", tracing::instrument(skip_all))]
@@ -1950,12 +1918,9 @@ impl<'buf, 'sym> Parser<'buf, 'sym> {
         let cloned = self.arena.alloc_clone(left);
         let inner = self.alloc(AstKind::Add {
             left: cloned,
-            right: right,
+            right,
         });
-        Ok(self.alloc(AstKind::CompoundAssign {
-            left: left,
-            right: inner,
-        }))
+        Ok(self.alloc(AstKind::CompoundAssign { left, right: inner }))
     }
 
     #[cfg_attr(feature = "tracing", tracing::instrument(skip_all))]
@@ -1963,12 +1928,9 @@ impl<'buf, 'sym> Parser<'buf, 'sym> {
         let cloned = self.arena.alloc_clone(left);
         let inner = self.alloc(AstKind::Subtract {
             left: cloned,
-            right: right,
+            right,
         });
-        Ok(self.alloc(AstKind::CompoundAssign {
-            left: left,
-            right: inner,
-        }))
+        Ok(self.alloc(AstKind::CompoundAssign { left, right: inner }))
     }
 
     #[cfg_attr(feature = "tracing", tracing::instrument(skip_all))]
@@ -1976,12 +1938,9 @@ impl<'buf, 'sym> Parser<'buf, 'sym> {
         let cloned = self.arena.alloc_clone(left);
         let inner = self.alloc(AstKind::Multiply {
             left: cloned,
-            right: right,
+            right,
         });
-        Ok(self.alloc(AstKind::CompoundAssign {
-            left: left,
-            right: inner,
-        }))
+        Ok(self.alloc(AstKind::CompoundAssign { left, right: inner }))
     }
 
     #[cfg_attr(feature = "tracing", tracing::instrument(skip_all))]
@@ -1989,12 +1948,9 @@ impl<'buf, 'sym> Parser<'buf, 'sym> {
         let cloned = self.arena.alloc_clone(left);
         let inner = self.alloc(AstKind::Divide {
             left: cloned,
-            right: right,
+            right,
         });
-        Ok(self.alloc(AstKind::CompoundAssign {
-            left: left,
-            right: inner,
-        }))
+        Ok(self.alloc(AstKind::CompoundAssign { left, right: inner }))
     }
 
     #[cfg_attr(feature = "tracing", tracing::instrument(skip_all))]
@@ -2002,12 +1958,9 @@ impl<'buf, 'sym> Parser<'buf, 'sym> {
         let cloned = self.arena.alloc_clone(left);
         let inner = self.alloc(AstKind::Modulo {
             left: cloned,
-            right: right,
+            right,
         });
-        Ok(self.alloc(AstKind::CompoundAssign {
-            left: left,
-            right: inner,
-        }))
+        Ok(self.alloc(AstKind::CompoundAssign { left, right: inner }))
     }
 
     #[cfg_attr(feature = "tracing", tracing::instrument(skip_all))]
@@ -2015,12 +1968,9 @@ impl<'buf, 'sym> Parser<'buf, 'sym> {
         let cloned = self.arena.alloc_clone(left);
         let inner = self.alloc(AstKind::And {
             left: cloned,
-            right: right,
+            right,
         });
-        Ok(self.alloc(AstKind::CompoundAssign {
-            left: left,
-            right: inner,
-        }))
+        Ok(self.alloc(AstKind::CompoundAssign { left, right: inner }))
     }
 
     #[cfg_attr(feature = "tracing", tracing::instrument(skip_all))]
@@ -2028,12 +1978,9 @@ impl<'buf, 'sym> Parser<'buf, 'sym> {
         let cloned = self.arena.alloc_clone(left);
         let inner = self.alloc(AstKind::Or {
             left: cloned,
-            right: right,
+            right,
         });
-        Ok(self.alloc(AstKind::CompoundAssign {
-            left: left,
-            right: inner,
-        }))
+        Ok(self.alloc(AstKind::CompoundAssign { left, right: inner }))
     }
 
     #[cfg_attr(feature = "tracing", tracing::instrument(skip_all))]
@@ -2041,12 +1988,9 @@ impl<'buf, 'sym> Parser<'buf, 'sym> {
         let cloned = self.arena.alloc_clone(left);
         let inner = self.alloc(AstKind::Xor {
             left: cloned,
-            right: right,
+            right,
         });
-        Ok(self.alloc(AstKind::CompoundAssign {
-            left: left,
-            right: inner,
-        }))
+        Ok(self.alloc(AstKind::CompoundAssign { left, right: inner }))
     }
 
     #[cfg_attr(feature = "tracing", tracing::instrument(skip_all))]
@@ -2054,12 +1998,9 @@ impl<'buf, 'sym> Parser<'buf, 'sym> {
         let cloned = self.arena.alloc_clone(left);
         let inner = self.alloc(AstKind::LeftShift {
             left: cloned,
-            right: right,
+            right,
         });
-        Ok(self.alloc(AstKind::CompoundAssign {
-            left: left,
-            right: inner,
-        }))
+        Ok(self.alloc(AstKind::CompoundAssign { left, right: inner }))
     }
 
     #[cfg_attr(feature = "tracing", tracing::instrument(skip_all))]
@@ -2067,19 +2008,16 @@ impl<'buf, 'sym> Parser<'buf, 'sym> {
         let cloned = self.arena.alloc_clone(left);
         let inner = self.alloc(AstKind::RightShift {
             left: cloned,
-            right: right,
+            right,
         });
-        Ok(self.alloc(AstKind::CompoundAssign {
-            left: left,
-            right: inner,
-        }))
+        Ok(self.alloc(AstKind::CompoundAssign { left, right: inner }))
     }
 
     fn peek_postfix_op(&self) -> bool {
-        match peek_tag!(self) {
-            Tag::Incr | Tag::Decr | Tag::LeftParen | Tag::LeftBracket => true,
-            _ => false,
-        }
+        matches!(
+            peek_tag!(self),
+            Tag::Incr | Tag::Decr | Tag::LeftParen | Tag::LeftBracket
+        )
     }
 
     #[cfg_attr(feature = "tracing", tracing::instrument(skip_all))]
@@ -2090,9 +2028,9 @@ impl<'buf, 'sym> Parser<'buf, 'sym> {
             } else if peek!(self, Tag::LeftBracket) {
                 expr = self.subscript(expr)?;
             } else if accept!(self, Tag::Incr) {
-                expr = self.alloc(AstKind::PostIncr { expr: expr });
+                expr = self.alloc(AstKind::PostIncr { expr });
             } else if accept!(self, Tag::Decr) {
-                expr = self.alloc(AstKind::PostDecr { expr: expr });
+                expr = self.alloc(AstKind::PostDecr { expr });
             } else {
                 return Err(error(Parsing(
                     ParsingError::InvalidPostfixExpression,
@@ -2149,21 +2087,28 @@ impl<'buf, 'sym> Parser<'buf, 'sym> {
             expect!(self, Tag::RightParen);
             inner_expr
         } else if accept!(self, Tag::Identifier) {
-            let name = self.tokens[0].as_ref().unwrap().clone();
-            let sym = self.symtab.get_sym(self.scope, &name.as_str(self.buf));
+            let name = *self.state.tokens[0].as_ref().unwrap();
+            let sym =
+                self.symtab.get_sym(self.state.scope, name.as_str(self.buf));
 
             self.alloc(AstKind::Identifier {
-                name: name.clone(),
+                name,
                 sym: if let Some(s) = sym {
                     Some(s)
                 } else {
-                    return Err(error(Parsing(
-                        ParsingError::UndeclaredIdentifier(
+                    return Err(error_at(
+                        name.loc,
+                        Parsing(ParsingError::UndeclaredIdentifier(
                             name.to_string(self.buf),
-                        ),
-                    )));
+                        )),
+                    ));
                 },
             })
+        } else if let Some(tok) = &self.state.tokens[1] {
+            return Err(error_at(
+                tok.loc,
+                Parsing(ParsingError::MalformedExpression),
+            ));
         } else {
             return Err(error(Parsing(ParsingError::MalformedExpression)));
         };
@@ -2184,7 +2129,7 @@ impl<'buf, 'sym> Parser<'buf, 'sym> {
 
         Ok(self.alloc(AstKind::Cast {
             type_spec: Some(type_spec),
-            expr: expr,
+            expr,
         }))
     }
 
@@ -2259,13 +2204,13 @@ impl<'buf, 'sym> Parser<'buf, 'sym> {
     }
 
     fn eof(&self) -> bool {
-        self.tokens[1].is_none()
+        self.state.tokens[1].is_none()
     }
 
     fn preload(&mut self) -> Result<(), Error> {
         for _ in 0..2 {
             for i in 0..2 {
-                self.tokens[i] = self.tokens[i + 1].clone();
+                self.state.tokens[i] = self.state.tokens[i + 1];
             }
             self.pull_token()?;
         }
@@ -2274,28 +2219,31 @@ impl<'buf, 'sym> Parser<'buf, 'sym> {
     }
 
     fn pull_token(&mut self) -> Result<(), Error> {
-        match self.tokeniser.next() {
+        match self.state.tokeniser.iter().next() {
             Some(res) => match res {
                 Ok(token) => {
-                    self.tokens[2] = Some(token);
+                    self.state.tokens[2] = Some(*token);
                     Ok(())
                 }
-                Err(e) => Err(e),
+                Err(e) => {
+                    self.state.tokens[2] = None;
+                    Err(e)
+                }
             },
             None => {
-                self.tokens[2] = None;
+                self.state.tokens[2] = None;
                 Ok(())
             }
         }
     }
 
     fn advance(&mut self) -> Result<(), Error> {
-        if self.tokens[1].is_none() {
+        if self.state.tokens[1].is_none() {
             panic!("attempt to read past end of file");
         }
 
         for i in 0..2 {
-            self.tokens[i] = self.tokens[i + 1].clone();
+            self.state.tokens[i] = self.state.tokens[i + 1];
         }
 
         self.pull_token()
