@@ -109,6 +109,14 @@ fn hex_digit(b: u8) -> u32 {
     }
 }
 
+fn combine_char(value: u32, ch: u32, count: u32) -> u32 {
+    if count == 0 {
+        ch
+    } else {
+        (value << 8) | (ch & 0xFF)
+    }
+}
+
 #[cold]
 #[inline(never)]
 fn keyword_map_ucn(source: &str) -> Tag {
@@ -520,18 +528,53 @@ impl<'buf> Tokeniser<'buf> {
 
     #[cold]
     #[inline(never)]
-    fn escape_sequence_value(&mut self) -> Result<u32, Error> {
+    fn esc_seq_value(&mut self) -> Result<u32, Error> {
         let mut ch = self.peek();
 
         match ch {
-            '\\' | '\'' | '"' | '?' | 'n' | 'r' | 't' | 'a' | 'b' | 'f'
-            | 'v' => {
+            '\\' => {
                 self.take_byte();
-                Ok(ch as u32)
+                Ok(b'\\' as u32)
             }
-            '0' => {
+            '\'' => {
                 self.take_byte();
-                Ok(0)
+                Ok(b'\'' as u32)
+            }
+            '"' => {
+                self.take_byte();
+                Ok(b'"' as u32)
+            }
+            '?' => {
+                self.take_byte();
+                Ok(b'?' as u32)
+            }
+            'a' => {
+                self.take_byte();
+                Ok(0x07)
+            }
+            'b' => {
+                self.take_byte();
+                Ok(0x08)
+            }
+            'f' => {
+                self.take_byte();
+                Ok(0x0C)
+            }
+            'n' => {
+                self.take_byte();
+                Ok(0x0A)
+            }
+            'r' => {
+                self.take_byte();
+                Ok(0x0D)
+            }
+            't' => {
+                self.take_byte();
+                Ok(0x09)
+            }
+            'v' => {
+                self.take_byte();
+                Ok(0x0B)
             }
             'x' => {
                 ch = self.take_and_peek();
@@ -584,7 +627,7 @@ impl<'buf> Tokeniser<'buf> {
                 }
                 Ok(cp)
             }
-            _ if ('1'..='7').contains(&ch) => {
+            _ if ('0'..='7').contains(&ch) => {
                 let mut value = (ch as u32) - ('0' as u32);
                 self.take_byte();
 
@@ -610,16 +653,12 @@ impl<'buf> Tokeniser<'buf> {
 
     #[cold]
     #[inline(never)]
-    fn escape_sequence(&mut self) -> Result<(), Error> {
+    fn esc_seq(&mut self) -> Result<(), Error> {
         let mut ch = self.peek();
 
         match ch {
             '\\' | '\'' | '"' | '?' | 'n' | 'r' | 't' | 'a' | 'b' | 'f'
             | 'v' => {
-                self.take_byte();
-                Ok(())
-            }
-            '0' => {
                 self.take_byte();
                 Ok(())
             }
@@ -668,7 +707,7 @@ impl<'buf> Tokeniser<'buf> {
                 }
                 Ok(())
             }
-            _ if ('1'..='7').contains(&ch) => {
+            _ if ('0'..='7').contains(&ch) => {
                 self.take_byte();
 
                 ch = self.peek();
@@ -691,31 +730,36 @@ impl<'buf> Tokeniser<'buf> {
 
     fn const_string(&mut self) -> Result<(), Error> {
         let mut has_esc_seq = false;
+        self.take_byte();
         loop {
-            self.take_byte();
-            loop {
-                let b = self.peek_byte();
-                match b {
-                    b'"' | b'\0' => break,
-                    b'\\' => {
-                        has_esc_seq = true;
-                        self.take_byte();
-                        self.escape_sequence()?;
-                    }
-                    0x80..=0xFF => {
-                        self.peek();
-                        self.take();
-                    }
-                    _ => self.take_byte(),
+            match self.peek_byte() {
+                b'"' => {
+                    self.take_byte();
+                    self.tok.tag = Tag::ConstString(has_esc_seq);
+                    return Ok(());
                 }
-            }
-            self.take_byte();
-            if self.peek() != '"' {
-                break;
+                b'\0' => {
+                    return Err(error(Tokenising(
+                        TokenisingError::UnterminatedString,
+                    )));
+                }
+                b'\n' | b'\r' => {
+                    return Err(error(Tokenising(
+                        TokenisingError::NewlineInStringLiteral,
+                    )));
+                }
+                b'\\' => {
+                    has_esc_seq = true;
+                    self.take_byte();
+                    self.esc_seq()?;
+                }
+                0x80..=0xFF => {
+                    self.peek();
+                    self.take();
+                }
+                _ => self.take_byte(),
             }
         }
-        self.tok.tag = Tag::ConstString(has_esc_seq);
-        Ok(())
     }
 
     fn const_char(&mut self) -> Result<(), Error> {
@@ -725,35 +769,50 @@ impl<'buf> Tokeniser<'buf> {
         let mut count = 0u32;
 
         loop {
-            let b = self.peek_byte();
-            match b {
-                b'\'' | b'\0' => break,
+            match self.peek_byte() {
+                b'\'' => {
+                    self.take_byte();
+                    break;
+                }
+                b'\0' => {
+                    return Err(error(Tokenising(
+                        TokenisingError::UnterminatedCharLiteral,
+                    )));
+                }
+                b'\n' | b'\r' => {
+                    return Err(error(Tokenising(
+                        TokenisingError::NewlineInCharLiteral,
+                    )));
+                }
                 b'\\' => {
                     self.take_byte();
-                    value =
-                        value.rotate_left(8) | self.escape_sequence_value()?;
+                    let ch = self.esc_seq_value()?;
+                    value = combine_char(value, ch, count);
+                    count += 1;
                 }
                 0x80..=0xFF => {
                     let ch = self.peek();
-                    value = value.rotate_left(8) | ch as u32;
+                    value = combine_char(value, ch as u32, count);
                     self.take();
+                    count += 1;
                 }
-                _ => {
-                    value = value.rotate_left(8) | b as u32;
+                b => {
+                    value = combine_char(value, b as u32, count);
                     self.take_byte();
+                    count += 1;
                 }
             }
-            count += 1;
         }
-
-        self.take_byte();
 
         if count == 0 {
             return Err(error(Tokenising(TokenisingError::InvalidCharLiteral)));
         }
 
-        let c = char::from_u32(value).unwrap_or('\0');
-        self.tok.tag = Tag::ConstChar(c);
+        if count == 1 && char::from_u32(value).is_none() {
+            return Err(error(Tokenising(TokenisingError::InvalidCharLiteral)));
+        }
+
+        self.tok.tag = Tag::ConstChar(value as i32);
 
         Ok(())
     }

@@ -108,6 +108,10 @@ pub enum TokenisingError {
     InvalidIntegerLiteral,
     InvalidIdentifier(String),
     UnterminatedBlockComment,
+    UnterminatedString,
+    UnterminatedCharLiteral,
+    NewlineInStringLiteral,
+    NewlineInCharLiteral,
     InvalidCharLiteral,
 }
 
@@ -232,6 +236,18 @@ impl TokenisingError {
             }
             TokenisingError::UnterminatedBlockComment => {
                 "unterminated block comment".to_string()
+            }
+            TokenisingError::UnterminatedString => {
+                "unterminated string literal".to_string()
+            }
+            TokenisingError::UnterminatedCharLiteral => {
+                "unterminated character literal".to_string()
+            }
+            TokenisingError::NewlineInStringLiteral => {
+                "newline in string literal".to_string()
+            }
+            TokenisingError::NewlineInCharLiteral => {
+                "newline in character literal".to_string()
             }
             TokenisingError::InvalidCharLiteral => {
                 "invalid character literal".to_string()

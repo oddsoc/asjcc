@@ -239,7 +239,12 @@ fn tokenise(translations: &[Translation], _config: &Config) {
         let mut tokeniser = Tokeniser::new(&text);
         let mut nr_tokens: usize = 0;
         for tok in &mut tokeniser {
-            tok.unwrap();
+            if let Err(e) = tok {
+                let filename =
+                    translation.c_file.file_name().unwrap().to_str().unwrap();
+                report_error(&e, &text, filename);
+                std::process::exit(1);
+            }
             nr_tokens += 1;
         }
         println!("{} tokens", nr_tokens);

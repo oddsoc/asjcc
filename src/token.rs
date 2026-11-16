@@ -128,7 +128,7 @@ pub enum TokenTag {
     ConstUnsignedLongLong(u64),
     ConstDouble(f64),
     ConstString(bool),
-    ConstChar(char),
+    ConstChar(i32),
     End,
 }
 
@@ -237,7 +237,16 @@ impl std::fmt::Display for TokenTag {
                     write!(f, "\"...\"")
                 }
             }
-            TokenTag::ConstChar(c) => write!(f, "'{}'", c),
+            TokenTag::ConstChar(val) => {
+                let v = *val as u32;
+                if (0x20..=0x7E).contains(&v) {
+                    write!(f, "'{}'", v as u8 as char)
+                } else if v <= 0xFF {
+                    write!(f, "'\\x{:02x}'", v)
+                } else {
+                    write!(f, "'\\x{:x}'", v)
+                }
+            }
             TokenTag::End => write!(f, "end of file"),
         }
     }
